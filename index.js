@@ -1,326 +1,129 @@
-'use strict';
-// Imports the Google Cloud client library
-// Wherever this code is running will need to access credentials for GCP
-// https://cloud.google.com/docs/authentication/production#finding_credentials_automatically
-// You can run this on your local machine as long as you have a way to get google-cloud credentials
+"use strict";
 
-const { DNS } = require('@google-cloud/dns');
-const fs = require('fs');
-module.exports.create = function (config) {
-	const projectId = config.projectId;
-	// if credentials filepath is defined, assume json and read into an object. Could consider other ways to lookup credentials
-	const credentials = (typeof config.credentials === "string") ?
-		JSON.parse(fs.readFileSync(config.credentials)) :
-		config.credentials;
+// Derived from acme-dns-01-gcp 0.0.10 by Renzo Tomlinson and contributors,
+// with modifications by Sandstorm contributors.
+// See README.md and LICENSE for attribution and licensing.
 
-	const dns = new DNS({
-		projectId,
-		credentials
-	});
-	const zonename = config.zonename;
-	const propagationDelay = config.propagationDelay || 5000;
+const fs = require("fs");
+const { DNS } = require("@google-cloud/dns");
 
-	// set and delete need to acquire the same lock for each of the commands
-	const domainLock = {};
-	async function acquireLock(dnsHostname) {
-		// try to acquire lock
-		//
-		console.log(`acquiring lock for ${dnsHostname}.`);
-		let lockValue = domainLock[dnsHostname];
+const CHANGE_ATTEMPTS = 10;
+const CHANGE_POLL_MS = 5000;
 
-		// if dnsHostname hasn't been defined then we need to create the key
-		if (lockValue === void(0)) {
-			domainLock[dnsHostname] = true;
-			lockValue = true;
-		}
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
 
-		while (!lockValue) {
-			console.log('wait 1 second');
-			await new Promise((resolve) => setTimeout(resolve, 1000));
-			lockValue = domainLock[dnsHostname];
-		}
-		console.log(`lock for ${dnsHostname} acquired`);
-		domainLock[dnsHostname] = false;
-		//do some stuff with the value you want locked. in this case dns stuff
+function unquoteTxt(value) {
+  if (value.length >= 2 && value.startsWith("\"") && value.endsWith("\"")) {
+    return value.slice(1, -1);
+  }
 
-		return true;
-	}
+  return value;
+}
 
-	async function releaseLock(dnsHostname) {
-		// just assume that we have the lock and we're going to change the lock value to true
-		domainLock[dnsHostname] = true;
-		console.log(`lock for ${dnsHostname} released`);
+async function waitForChange(change, operation) {
+  let metadata = change.metadata;
+  for (let attempt = 0; metadata.status !== "done"; attempt += 1) {
+    if (attempt >= CHANGE_ATTEMPTS) {
+      throw new Error(`Timed out waiting for Google Cloud DNS ${operation}.`);
+    }
 
-		return true;
-	}
+    await sleep(CHANGE_POLL_MS);
+    [metadata] = await change.getMetadata();
+  }
 
-	return {
-		propagationDelay: propagationDelay,
-		init: async function (opts) {
-			console.log('init function called...');
-			return null;
-		},
-		zones: async function (data) {
-			console.log('zones function called...');
-			try {
-				const zone = dns.zone(zonename);
-				const metadataResponse = await zone.getMetadata();
-				const dnsName = metadataResponse[0]['dnsName'];
-				return [dnsName.slice(0, -1)]; // to remove the "." on the end
-			} catch (err) {
-				console.error('ZONES: ERROR in zones:', err);
-				return null;
-			}
-		},
-		set: async function (data) {
-			console.log('set function called...');
-			var ch = data.challenge;
+  return metadata;
+}
 
-			var recordDnsName = ch.dnsHost + '.';
+module.exports.create = function create(config) {
+  const credentials = typeof config.credentials === "string"
+    ? JSON.parse(fs.readFileSync(config.credentials, "utf8"))
+    : config.credentials;
+  const dns = config.dns || new DNS({ projectId: config.projectId, credentials });
+  const zone = dns.zone(config.zonename);
+  const locks = new Map();
 
-			var txt = ch.dnsAuthorization;
+  async function withHostnameLock(hostname, operation) {
+    const previous = locks.get(hostname) || Promise.resolve();
+    let release;
+    const current = new Promise((resolve) => {
+      release = resolve;
+    });
+    const queued = previous.then(() => current);
+    locks.set(hostname, queued);
+    await previous;
 
-			await acquireLock(recordDnsName);
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (locks.get(hostname) === queued) locks.delete(hostname);
+    }
+  }
 
-			const zone = dns.zone(zonename);
-			// wildcard shares same dnsHost with non-wildcard so check if record exists and if so, add the txt
+  async function findTxtRecord(name) {
+    const [records] = await zone.getRecords({ name, type: "TXT" });
+    return records[0];
+  }
 
-			let record;
-			try {
-				const query = {
-					name: recordDnsName,
-					type: 'TXT'
-				};
+  async function deleteRecord(record) {
+    const [change] = await record.delete();
+    await waitForChange(change, "record deletion");
+  }
 
-				const [recordResponse] = await zone.getRecords(query);
-				if (recordResponse.length == 0) {
-					//nothing found
-					console.log('SET: No records found for recordDnsName: ', recordDnsName);
-					console.log('SET: Creating new record entry....');
-					data = [txt];
-				} else {
-					console.log('SET: Existing records found');
-					let existingRecord = recordResponse[0];
-					data = existingRecord.data.slice();
+  async function addRecord(name, values) {
+    const record = zone.record("txt", { name, ttl: 300, data: values });
+    const [change] = await zone.addRecords(record);
+    await waitForChange(change, "record update");
+    return change.metadata.id;
+  }
 
-					//google dns response wraps the text values in an additional set of quotes. the google dns seems to drop them when you put a new record set but I'm unsure about the specifics
-					//I'm going to assume that strings are wrapped in quotes and drop the first and last char of each value.
+  return {
+    propagationDelay: config.propagationDelay || 5000,
 
-					data = data.map((x) => x.slice(1, -1));
-					console.log('SET: Old data in set: ', data);
-					if (data.includes(txt)) {
-						console.log(
-							'SET: Authorization code has already been added to the txt record for :' +
-								recordDnsName +
-								' Something is probably wrong.'
-						);
-						console.log('SET: Exiting...');
-						return null;
-					}
+    async init() {
+      return null;
+    },
 
-					data.push(txt); // add the authorization code to data array
-					console.log('SET: New data in set: ', data);
-					// there isn't a way to "update" a record set, so we have to delete then add it back. I guess we'll just add a timer to wait between the delete and add steps
-					const [createChangeResponse] = await existingRecord.delete();
-					let [deleteChangeMetadata] = await createChangeResponse.getMetadata();
+    async zones() {
+      const [metadata] = await zone.getMetadata();
+      return [metadata.dnsName.replace(/\.$/, "")];
+    },
 
-					let a = 0;
-					let changeStatus = deleteChangeMetadata.status;
+    async set({ challenge }) {
+      const recordName = `${challenge.dnsHost}.`;
+      return withHostnameLock(recordName, async () => {
+        const existing = await findTxtRecord(recordName);
+        const values = existing ? existing.data.map(unquoteTxt) : [];
+        if (values.includes(challenge.dnsAuthorization)) return null;
+        if (existing) await deleteRecord(existing);
+        return addRecord(recordName, values.concat(challenge.dnsAuthorization));
+      });
+    },
 
-					while (changeStatus != 'done') {
-						if (a >= 10) {
-							throw 'timeout for dns record delete. You probably need to fix something manually now.';
-						}
-						console.log(
-							'SET: Delete status pending, will try up to 10 times. currently at attempt: ' +
-								a
-						);
-						await new Promise((r) => setTimeout(r, 5000));
-						let [changeMetadata] = await createChangeResponse.getMetadata();
-						changeStatus = changeMetadata.status;
-						a++;
-					}
-					console.log('SET: Record delete should be done');
-				}
+    async get({ challenge }) {
+      const recordName = `${challenge.dnsHost}.`;
+      const existing = await findTxtRecord(recordName);
+      if (!existing) return null;
+      const found = existing.data.map(unquoteTxt).includes(challenge.dnsAuthorization);
+      return found ? { dnsAuthorization: challenge.dnsAuthorization } : null;
+    },
 
-				const record = zone.record('txt', {
-					name: recordDnsName,
-					ttl: 300,
-					data
-				});
-				let [change] = await zone.addRecords(record);
+    async remove({ challenge }) {
+      const recordName = `${challenge.dnsHost}.`;
+      return withHostnameLock(recordName, async () => {
+        const existing = await findTxtRecord(recordName);
+        if (!existing) return null;
 
-				let a = 0;
-				let changeStatus = change.metadata.status;
-				let changeId = change.metadata.id;
+        const values = existing.data.map(unquoteTxt);
+        if (!values.includes(challenge.dnsAuthorization)) return null;
 
-				while (changeStatus != 'done') {
-					if (a >= 10) {
-						throw 'timeout for dns record set. You probably need to fix something manually now.';
-					}
-					console.log(
-						'SET: Add status pending, will try up to 10 times. currently at attempt: ' +
-							a
-					);
-					await new Promise((r) => setTimeout(r, 5000));
-					let [changeMetadata] = await change.getMetadata();
-					changeStatus = changeMetadata.status;
-					a++;
-				}
-				console.log('SET: Record updated or added');
-				return changeId;
-			} catch (err) {
-				console.error('SET: Error trying to add a record');
-				//
-				console.error('SET: ERROR in set:', err);
-				return null;
-			} finally {
-				await releaseLock(recordDnsName);
-			}
-		},
-		get: async function (data) {
-			console.log('get function called...');
-			var ch = data.challenge;
-			let dnsAuthorization = ch.dnsAuthorization;
-			var recordDnsName = ch.dnsPrefix + '.' + ch.dnsZone + '.';
-			const zone = dns.zone(zonename);
-			const query = {
-				name: recordDnsName,
-				type: 'TXT'
-			};
-			try {
-				console.log('GET: Trying to get txt record for ' + recordDnsName);
-				const [recordsResponse] = await zone.getRecords(query);
-				if (recordsResponse.length == 0) {
-					//just to make  it explicit
-					return null;
-				}
-				let existingRecord = recordsResponse[0].data;
-				let data = existingRecord.slice();
-
-				//google dns response wraps the text values in an additional set of quotes. the google dns seems to drop them when you put a new record set but I'm unsure about the specifics
-				//I'm going to assume that strings are wrapped in quotes and drop the first and last char of each value.
-
-				data = data.map((x) => x.slice(1, -1));
-				if (!data.includes(dnsAuthorization)) {
-					console.log('GET: We didnt find the dnsAuthorization text in the records');
-					console.log('GET: exiting...');
-					return null;
-				}
-
-				// Slice because data from the google dns comes with quotes which are actually part of the string and not the object representation
-				return {
-					dnsAuthorization
-				};
-			} catch (err) {
-				console.error('GET: Error trying to GET the txt record');
-				console.error(err);
-				return null;
-			}
-			// TODO use :name_like
-			// https://developer.dnsimple.com/v2/zones/records/
-		},
-		remove: async function (data) {
-			console.log('remove function called...');
-			var ch = data.challenge;
-			var dnsAuthorization = ch.dnsAuthorization;
-			var recordDnsName = ch.dnsHost + '.';
-			await acquireLock(recordDnsName);
-			try {
-				const zone = dns.zone(zonename);
-				const query = {
-					name: recordDnsName,
-					type: 'TXT'
-				};
-				console.log('REMOVE: Getting the records in REMOVE');
-
-				const [recordResponse] = await zone.getRecords(query);
-				if (recordResponse.length == 0) {
-					//nothing found
-					console.log('REMOVE: no records found for recordDnsName: ', recordDnsName);
-					console.log('REMOVE: exiting....');
-					return null;
-				}
-
-				console.log('REMOVE: Attempting to delete record...');
-
-				// check the data response
-				let record = recordResponse[0];
-				let existingRecord = record.data;
-				let data = existingRecord.slice();
-
-				//google dns response wraps the text values in an additional set of quotes. the google dns seems to drop them when you put a new record set but I'm unsure about the specifics
-				//I'm going to assume that strings are wrapped in quotes and drop the first and last char of each value.
-
-				data = data.map((x) => x.slice(1, -1));
-				// check to see if dnsAuthorization is in data
-				if (!data.includes(dnsAuthorization)) {
-					console.log('REMOVE: We didnt find the dnsAuthorization text in the records');
-					console.log('REMOVE: Possible that it has already been removed. Exiting...');
-					return null;
-				}
-				const [createChangeResponse] = await record.delete();
-				let [deleteChangeMetadata] = await createChangeResponse.getMetadata();
-
-				let a = 0;
-				let changeStatus = deleteChangeMetadata.status;
-
-				while (changeStatus != 'done') {
-					if (a >= 10) {
-						throw 'timeout for dns record delete. You probably need to fix something manually now.';
-					}
-					console.log(
-						'REMOVE: Delete status pending, will try up to 10 times. currently at attempt: ' +
-							a
-					);
-					await new Promise((r) => setTimeout(r, 5000));
-					let [changeMetadata] = await createChangeResponse.getMetadata();
-					changeStatus = changeMetadata.status;
-					a++;
-				}
-				console.log('REMOVE: Old record delete should be done');
-
-				// if dnsAuthorization is the only value (length == 1) we can just delete the whole record and we know that dnsAuthorization is in the list
-				if (data.length === 1) {
-					console.log('REMOVE: Delete record task completed');
-					return true;
-				} else {
-					// remove the dnsAuthorization value from the data records and add the updated record
-					let filteredData = data.filter((x) => x !== dnsAuthorization);
-					const record = zone.record('txt', {
-						name: recordDnsName,
-						ttl: 300,
-						data: filteredData
-					});
-					let [change] = await zone.addRecords(record);
-					let a = 0;
-					let changeStatus = change.metadata.status;
-					let changeId = change.metadata.id;
-
-					while (changeStatus != 'done') {
-						if (a >= 10) {
-							throw 'timeout for dns record set. You probably need to fix something manually now.';
-						}
-						console.log(
-							'REMOVE: Add status pending, will try up to 10 times. currently at attempt: ' +
-								a
-						);
-						await new Promise((r) => setTimeout(r, 5000));
-						let [changeMetadata] = await change.getMetadata();
-						changeStatus = changeMetadata.status;
-						a++;
-					}
-					console.log(
-						'REMOVE: Updated record set should be done with dnsAuthorization removed'
-					);
-				}
-				return true;
-			} catch (err) {
-				console.error('ERROR: ', err);
-				return null;
-			} finally {
-				await releaseLock(recordDnsName);
-			}
-		}
-	};
+        await deleteRecord(existing);
+        const remaining = values.filter((value) => value !== challenge.dnsAuthorization);
+        if (remaining.length > 0) await addRecord(recordName, remaining);
+        return true;
+      });
+    },
+  };
 };
